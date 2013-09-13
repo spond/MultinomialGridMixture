@@ -1,6 +1,39 @@
-#!/usr/bin/env julia
+#!/usr/bin/env julia --color=yes
 
-function rategrid(n::Integer=12)
+using ArgParse
+using FastaIO
+
+function countmsa(msa)
+    counts = nothing
+    ncols = 0
+    for (name, seq) in FastaReader(msa)
+        if counts == nothing
+            ncols = length(seq)
+            counts = zeros(Int64, (ncols, 4))
+        elseif length(seq) != ncols
+            error("provided file is not an MSA! length($name) = $(length(seq)), not $ncols!")
+        end
+        for (i, l) in enumerate(seq)
+            L = uppercase(l)
+            j = 0
+            if L == 'A'
+                j = 1
+            elseif L == 'C'
+                j = 2
+            elseif L == 'G'
+                j = 3
+            elseif L == 'T'
+                j = 4
+            end
+            if j > 0
+                counts[i, j] += 1
+            end
+        end
+    end
+    counts
+end
+
+function rategrid(n::Integer)
     rates = 1 / (2 .^ linspace(2, 10, n))
     rg = Array(Float64, (4 * length(rates) ^ 3, 4))
     i = 1
@@ -52,7 +85,7 @@ function gridscores(counts::Array{Int64,2}, rates::Array{Float64,2})
     scalers = Array(Float64, (nsites,))
     for i in 1:nsites
         m = realmin(Float64)
-        for j in 1:npoints 
+        for j in 1:npoints
             s = lmc(counts[i, :])
             for k in 1:4
                 s += counts[i, k] * log(rates[j, k])
@@ -63,7 +96,7 @@ function gridscores(counts::Array{Int64,2}, rates::Array{Float64,2})
             conditionals[j, i] = s
         end
         scalers[i] = m
-        for j in 1:npoints 
+        for j in 1:npoints
             s = conditionals[j, i] - m
             if s < smin
                 conditionals[j, i] = 0
@@ -142,7 +175,7 @@ function mcmc(conditionals, scalers, ntotal=10_000_000, nburnin=5_000_000, expec
             for k in 1:nsites
                 diffvec[k] = (conditionals[j, k] - conditionals[i, k]) * change
             end
-    
+
             lldiff = 0
             for k in 1:nsites
                 lldiff += log(current_site_likelihoods[k] + diffvec[k])
@@ -176,11 +209,11 @@ function mcmc(conditionals, scalers, ntotal=10_000_000, nburnin=5_000_000, expec
         end
 
         if step % nsample == 0
-            print("\rrunning MCMC chain: step = $step/$ntotal, mean logL = $llstr, acceptance rate = $(trunc(accepted_steps / step, 3)) .. ")
+            progress("running MCMC chain: step = $step/$ntotal, mean logL = $llstr, acceptance rate = $(trunc(accepted_steps / step, 3)) .. ")
         end
     end
 
-    println("done, took $(toq())s")
+    done()
 
     (sampled_likelihoods, sampled_weights)
 end
@@ -210,40 +243,80 @@ function postproc(conditionals::Array{Float64,2}, ws::Array{Float64,2})
     ((1 / normalization) .* eye(nsites)) * posteriors
 end
 
-function callvariants(rates::Array{Float64,2}, posteriors::Array{Float64,2}, threshold::Float64=0.1, posterior_threshold::Float64=0.999)
+function callvariants(
+        counts::Array{Int64,2},
+        rates::Array{Float64,2},
+        posteriors::Array{Float64,2},
+        threshold::Float64=0.1,
+        posterior_threshold::Float64=0.999)
     nsites, npoints = size(posteriors)
-    haz = posteriors * map(x -> x > threshold, rates)
+    posterior_prob = posteriors * map(x -> x > threshold, rates)
     for i in 1:nsites
         s = Set{Char}()
         for (j, c) in enumerate("ACGT")
-            if haz[i, j] > posterior_threshold
+            if posterior_prob[i, j] > posterior_threshold
                 push!(s, c)
             end
         end
         if length(s) > 1
-            println("$i: $(join(sort!(collect(s))))")
+            println("$i: $(join(sort!(collect(s)))),\t[$(join(counts[i, :], '\t'))]")
         end
     end
 end
 
-function main()
-    length(ARGS) == 1 || error("please provide per-site count data")
-    print("loading data .. ")
+function done()
+    print_with_color(:blue, STDERR, "done, took $(toq())s")
+    println("")
+end
+function progress(args...)
+    print_with_color(:blue, STDERR, "\rINFO: ", args...)
+end
+function update(args...)
+    print_with_color(:blue, STDERR, "INFO: ", args...)
     tic()
-    counts = readdlm(ARGS[1], '\t', Int64)
-    println("done, took $(toq())s")
-    print("generating rate grid .. ")
-    tic()
-    # rates = loadrates()
-    rates = rategrid()
-    println("done, took $(toq())s")
-    print("computing grid scores .. ")
-    tic()
-    conditionals, scalers = gridscores(counts, rates)
-    println("done, took $(toq())s")
-    lls, ws = mcmc(conditionals, scalers, 2_000_000, 1_000_000)
-    posteriors = postproc(conditionals', ws)
-    callvariants(rates, posteriors, 0.1, 0.95)
 end
 
-main()
+function main(args)
+    s = ArgParseSettings()
+    s.description = "call variants using a multinomial model sampled by MCMC"
+    @add_arg_table s begin
+        "--grid-density", "-g"
+            arg_type = Int64
+            default = 14
+        "--chain-length", "-c"
+            arg_type = Int64
+            default = 2_000_000
+        "--burnin-length", "-b"
+            arg_type = Int64
+            default = 1_000_000
+        "--target-rate", "-t"
+            arg_type = Float64
+            default = 0.01
+        "--posterior-threshold", "-p"
+            arg_type = Float64
+            default = 0.95
+        "msa"
+            required = true
+    end
+    parsed_args = parse_args(args, s)
+
+    update("loading MSA .. ")
+    counts = countmsa(parsed_args["msa"])
+    done()
+
+    update("generating rate grid .. ")
+    # rates = loadrates()
+    rates = rategrid(parsed_args["grid-density"])
+    done()
+
+    update("computing grid scores .. ")
+    conditionals, scalers = gridscores(counts, rates)
+    done()
+
+    lls, ws = mcmc(conditionals, scalers, parsed_args["chain-length"], parsed_args["burnin-length"])
+    posteriors = postproc(conditionals', ws)
+
+    callvariants(counts, rates, posteriors, parsed_args["target-rate"], parsed_args["posterior-threshold"])
+end
+
+main(ARGS)
