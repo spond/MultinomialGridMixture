@@ -1,4 +1,4 @@
-#!/usr/bin/env julia --color=yes
+#!/usr/bin/env julia
 
 using ArgParse
 using FastaIO
@@ -6,30 +6,33 @@ using FastaIO
 function countmsa(msa)
     counts = nothing
     ncols = 0
-    for (name, seq) in FastaReader(msa)
+    tic()
+    for (i, (name, seq)) in enumerate(FastaReader(msa))
         if counts == nothing
             ncols = length(seq)
             counts = zeros(Int64, (ncols, 4))
         elseif length(seq) != ncols
             error("provided file is not an MSA! length($name) = $(length(seq)), not $ncols!")
         end
-        for (i, l) in enumerate(seq)
+        for (j, l) in enumerate(seq)
             L = uppercase(l)
-            j = 0
+            k = 0
             if L == 'A'
-                j = 1
+                k = 1
             elseif L == 'C'
-                j = 2
+                k = 2
             elseif L == 'G'
-                j = 3
+                k = 3
             elseif L == 'T'
-                j = 4
+                k = 4
             end
-            if j > 0
-                counts[i, j] += 1
+            if k > 0
+                counts[j, k] += 1
             end
         end
+        progress("loading msa: read $i sequence$(i > 1 ? "s" : "") .. ")
     end
+    done()
     counts
 end
 
@@ -266,7 +269,7 @@ end
 
 function done()
     print_with_color(:blue, STDERR, "done, took $(toq())s")
-    println("")
+    println(STDERR)
 end
 function progress(args...)
     print_with_color(:blue, STDERR, "\rINFO: ", args...)
@@ -279,6 +282,7 @@ end
 function main(args)
     s = ArgParseSettings()
     s.description = "call variants using a multinomial model sampled by MCMC"
+    
     @add_arg_table s begin
         "--grid-density", "-g"
             arg_type = Int64
@@ -298,11 +302,9 @@ function main(args)
         "msa"
             required = true
     end
-    parsed_args = parse_args(args, s)
 
-    update("loading MSA .. ")
+    parsed_args = parse_args(args, s)
     counts = countmsa(parsed_args["msa"])
-    done()
 
     update("generating rate grid .. ")
     # rates = loadrates()
