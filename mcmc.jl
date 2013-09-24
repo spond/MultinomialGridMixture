@@ -3,7 +3,29 @@
 using ArgParse
 using FastaIO
 
-function countmsa(msa)
+const AMBIGS = Dict{String, Char}(
+    [
+        "A", "C", "G", "T",
+        "AC", "AG", "AT", "CG", "CT", "GT",
+        "ACG", "ACT", "AGT", "CGT",
+        "ACGT"],
+    [
+        'A', 'C', 'G', 'T',
+        'M', 'R', 'W', 'S', 'Y', 'K',
+        'V', 'H', 'D', 'B',
+        'N'])
+
+function index(s::String, c::Char)
+    for i in 1:length(s)
+        @inbounds s_i = s[i]
+        if c == s_i
+            return i
+        end
+    end
+    0
+end
+
+function countmsa(msa::String, alphabet::String)
     counts = nothing
     ncols = 0
     tic()
@@ -14,29 +36,23 @@ function countmsa(msa)
         elseif length(seq) != ncols
             error("provided file is not an MSA! length($name) = $(length(seq)), not $ncols!")
         end
-        for (j, l) in enumerate(seq)
-            L = uppercase(l)
-            k = 0
-            if L == 'A'
-                k = 1
-            elseif L == 'C'
-                k = 2
-            elseif L == 'G'
-                k = 3
-            elseif L == 'T'
-                k = 4
-            end
-            if k > 0
-                counts[j, k] += 1
+        for j in 1:length(seq)
+            @inbounds L = uppercase(seq[j])
+            for k in 1:length(alphabet)
+                @inbounds c = alphabet[k]
+                if L == c
+                    counts[j, k] += 1
+                end
             end
         end
-        progress("loading msa: read $i sequence$(i > 1 ? "s" : "") .. ")
+        progress("loading msa: read $i sequences .. ")
     end
     done()
     counts
 end
 
 function rategrid(n::Integer)
+    update("generating rate grid .. ")
     rates = 1 / (2 .^ linspace(2, 10, n))
     rg = Array(Float64, (4 * length(rates) ^ 3, 4))
     i = 1
@@ -52,7 +68,8 @@ function rategrid(n::Integer)
             end
         end
     end
-    rg
+    done()
+    return rg
 end
 
 lfact_cache = Float64[log(1)]
@@ -65,53 +82,59 @@ function lfact(N::Integer)
     if n < N
         resize!(lfact_cache, N)
         for i in (n + 1):N
-            lfact_cache[i] = lfact_cache[i - 1] + log(i)
+            @inbounds lfact_cache[i] = lfact_cache[i - 1] + log(i)
         end
     end
-    lfact_cache[N]
+    @inbounds return lfact_cache[N]
 end
 
-function lmc(data::Array{Int64})
-    c = lfact(sum(data))
-    for d in data
-        c -= lfact(d)
+function lmc(counts::Array{Int64,2}, site::Int64, nchars::Int64)
+    c = 0.0
+    s = 0
+    for char in 1:nchars
+        @inbounds c -= lfact(counts[site, char])
+        @inbounds s += counts[site, char]
     end
-    c
+    return c + lfact(s)
 end
 
 const smin = log(realmin(Float64))
 
-function gridscores(counts::Array{Int64,2}, rates::Array{Float64,2})
+function gridscores(counts::Array{Int64,2}, rates::Array{Float64,2}, alphabet::String)
+    update("computing grid scores .. ")
+    nchars = length(alphabet)
     npoints, _ = size(rates)
     nsites, _ = size(counts)
     conditionals = Array(Float64, (npoints, nsites))
     scalers = Array(Float64, (nsites,))
     for i in 1:nsites
         m = realmin(Float64)
+        @inbounds c = lmc(counts, i, nchars)
         for j in 1:npoints
-            s = lmc(counts[i, :])
-            for k in 1:4
-                s += counts[i, k] * log(rates[j, k])
+            s = c
+            for k in 1:nchars
+                @inbounds s += counts[i, k] * log(rates[j, k])
             end
             if s > m
                 m = s
             end
-            conditionals[j, i] = s
+            @inbounds conditionals[j, i] = s
         end
-        scalers[i] = m
+        @inbounds scalers[i] = m
         for j in 1:npoints
-            s = conditionals[j, i] - m
+            @inbounds s = conditionals[j, i] - m
             if s < smin
-                conditionals[j, i] = 0
+                @inbounds conditionals[j, i] = 0
             else
-                conditionals[j, i] = exp(s)
+                @inbounds conditionals[j, i] = exp(s)
             end
         end
     end
-    (conditionals, scalers)
+    done()
+    return (conditionals, scalers)
 end
 
-function lddens(weights::Array{Float64,2}, alpha::Float64)
+function ldensity(weights::Array{Float64,2}, alpha::Float64)
     if min(weights) <= 1e-10
         return 1e-10
     end
@@ -121,19 +144,28 @@ function lddens(weights::Array{Float64,2}, alpha::Float64)
     n = length(weights)
     r = lgamma(n * alpha) - n * lgamma(alpha)
     for i in 1:n
-        r += log(weights[i]) * (alpha - 1)
+        @inbounds r += log(weights[i]) * (alpha - 1)
     end
-    r
+    return r
 end
 
 function jll(conditionals::Array{Float64,2}, scalers::Array{Float64,1}, weights::Array{Float64,2}, alpha::Float64)
     ll = sum(log(weights * conditionals) + scalers')
-    dir = lddens(weights, alpha)
-    (ll, dir)
+    dir = ldensity(weights, alpha)
+    return (ll, dir)
 end
 
 # alpha was once called concentration_parameter
-function mcmc(conditionals, scalers, ntotal=10_000_000, nburnin=5_000_000, expected_nsamples=100, alpha=0.5)
+function mcmc(
+        conditionals::Array{Float64,2},
+        scalers::Array{Float64,1};
+        chain_length::Int64=10_000_000,
+        burnin_fraction::Float64=0.5,
+        expected_nsamples::Int64=100,
+        alpha::Float64=0.5)
+
+    nburnin = iround(chain_length * burnin_fraction)
+
     npoints, nsites = size(conditionals)
 
     normalized_by_site = ones((1, npoints)) * conditionals
@@ -145,7 +177,7 @@ function mcmc(conditionals, scalers, ntotal=10_000_000, nburnin=5_000_000, expec
 
     stepsize = max(min(1 / npoints, 1 / nsites), median(weights))
 
-    nsample = div(ntotal - nburnin, expected_nsamples)
+    nsample = div(chain_length - nburnin, expected_nsamples)
     sampled_weights = zeros(Float64, (expected_nsamples, npoints))
     sampled_likelihoods = zeros(Float64, (expected_nsamples,))
 
@@ -159,32 +191,31 @@ function mcmc(conditionals, scalers, ntotal=10_000_000, nburnin=5_000_000, expec
     sample_idx = 0
 
     diffvec = Array(Float64, (1, nsites))
-    rng = 1:npoints
+    idxs = 1:npoints
     llstr = "(burning in)"
 
     tic()
 
-    for step in 1:ntotal
+    for step in 1:chain_length
 
-        i = rand(rng)
-        j = rand(rng)
+        i = rand(idxs)
+        j = rand(idxs)
         while i == j
-            j = rand(rng)
+            j = rand(idxs)
         end
 
         change = rand() * stepsize
+        @inbounds weights_i = weights[i]
+        @inbounds weights_j = weights[j]
 
-        if weights[i] > change
-            for k in 1:nsites
-                diffvec[k] = (conditionals[j, k] - conditionals[i, k]) * change
-            end
-
+        if weights_i > change
             lldiff = 0
             for k in 1:nsites
-                lldiff += log(current_site_likelihoods[k] + diffvec[k])
+                @inbounds diffvec[k] = (conditionals[j, k] - conditionals[i, k]) * change
+                @inbounds lldiff += log(current_site_likelihoods[k] + diffvec[k])
             end
             lldiff -= current_site_logsum
-            dirdiff = (alpha - 1) * (log((weights[i] - change) / weights[i]) + log((weights[j] + change) / weights[j]))
+            @inbounds dirdiff = (alpha - 1) * (log((weights_i - change) / weights_i) + log((weights_j + change) / weights_j))
             movecost = exp(lldiff + dirdiff)
 
             if rand() <= movecost
@@ -194,8 +225,8 @@ function mcmc(conditionals, scalers, ntotal=10_000_000, nburnin=5_000_000, expec
                 current_site_likelihoods += diffvec
                 current_site_logsum += lldiff
 
-                weights[i] -= change
-                weights[j] += change
+                @inbounds weights[i] -= change
+                @inbounds weights[j] += change
 
                 accepted_steps += 1
             end
@@ -212,13 +243,13 @@ function mcmc(conditionals, scalers, ntotal=10_000_000, nburnin=5_000_000, expec
         end
 
         if step % nsample == 0
-            progress("running MCMC chain: step = $step/$ntotal, mean logL = $llstr, acceptance rate = $(trunc(accepted_steps / step, 3)) .. ")
+            progress("running MCMC chain: step = $step/$chain_length, mean logL = $llstr, acceptance rate = $(trunc(accepted_steps / step, 3)) .. ")
         end
     end
 
     done()
 
-    (sampled_likelihoods, sampled_weights)
+    return (sampled_likelihoods, sampled_weights)
 end
 
 function loadrates()
@@ -227,44 +258,87 @@ function loadrates()
     rates = Array(Float64, (nrates, 4))
     rates[:, 1:3] = rates3
     for i in 1:nrates
-        rates[i, 4] = 1.0 - sum(rates[i, 1:3])
+        @inbounds rates[i, 4] = 1.0 - sum(rates[i, 1:3])
     end
-    rates
+    return rates
 end
 
 function postproc(conditionals::Array{Float64,2}, ws::Array{Float64,2})
+    update("computing posterior probabilities .. ")
     nsites, npoints = size(conditionals)
     nsamples, _ = size(ws)
     priors = zeros(Float64, (1, npoints))
     for i in 1:nsamples
-        priors += ws[i, :]
+        @inbounds priors += ws[i, :]
     end
     priors = priors' / nsamples
     priors /= sum(priors)
     normalization = conditionals * priors
-    posteriors = conditionals * (priors .* eye(npoints))
-    ((1 / normalization) .* eye(nsites)) * posteriors
+    posteriors = ((1 / normalization) .* eye(nsites)) * (conditionals * (priors .* eye(npoints)))
+    done()
+    return posteriors
 end
 
 function callvariants(
         counts::Array{Int64,2},
         rates::Array{Float64,2},
         posteriors::Array{Float64,2},
-        threshold::Float64=0.1,
+        alphabet::String;
+        target_rate::Float64=0.1,
         posterior_threshold::Float64=0.999)
+
+    update("calling variants .. ")
     nsites, npoints = size(posteriors)
-    posterior_prob = posteriors * map(x -> x > threshold, rates)
+    posterior_prob = posteriors * map(x -> x > target_rate, rates)
+    variants = Dict{Int64,String}()
     for i in 1:nsites
         s = Set{Char}()
-        for (j, c) in enumerate("ACGT")
+        for j in 1:length(alphabet)
             if posterior_prob[i, j] > posterior_threshold
-                push!(s, c)
+                push!(s, alphabet[j])
             end
         end
+        s_ = join(sort!(collect(s)))
         if length(s) > 1
-            println("$i: $(join(sort!(collect(s)))),\t[$(join(counts[i, :], '\t'))]")
+            println("$i: $s_,\t[$(join(counts[i, :], '\t'))]")
+        end
+        variants[i] = s_
+    end
+    done()
+    return variants
+end
+
+function filterseqs(msa::String, variants::Dict{Int64,String}, dest::String, alphabet::String)
+    tic()
+    sites = sort!(collect(keys(variants)))
+    varmask = zeros(Bool, ((length(variants), 4)))
+    for i in 1:length(sites)
+        site = sites[i]
+        for j in 1:length(alphabet)
+            if alphabet[j] in variants[site]
+                varmask[i, j] = true
+            end
         end
     end
+    FastaWriter(dest == "-" ? STDOUT : dest) do fw
+        for (i, (name, seq)) in enumerate(FastaReader(msa))
+            v = 1
+            seq_ = Array(Char, (length(seq),))
+            for j in 1:length(seq)
+                seq_[j] = seq[j]
+                if v < length(sites) && j == sites[v]
+                    idx = index(alphabet, seq[j])
+                    if idx > 0 && !varmask[v, idx]
+                        seq_[j] = AMBIGS[variants[sites[v]]]
+                    end
+                    v += 1
+                end
+            end
+            writeentry(fw, name, join(seq_, ""))
+            progress("filtering unsupported variants: processed $i sequences .. ")
+        end
+    end
+    done()
 end
 
 function done()
@@ -282,7 +356,7 @@ end
 function main(args)
     s = ArgParseSettings()
     s.description = "call variants using a multinomial model sampled by MCMC"
-    
+
     @add_arg_table s begin
         "--grid-density", "-g"
             arg_type = Int64
@@ -290,35 +364,44 @@ function main(args)
         "--chain-length", "-c"
             arg_type = Int64
             default = 2_000_000
-        "--burnin-length", "-b"
-            arg_type = Int64
-            default = 1_000_000
+        "--burnin-fraction", "-b"
+            arg_type = Float64
+            default = 0.5
         "--target-rate", "-t"
             arg_type = Float64
             default = 0.01
         "--posterior-threshold", "-p"
             arg_type = Float64
             default = 0.95
+        "--filter", "-f"
+            arg_type = String
         "msa"
             required = true
     end
 
     parsed_args = parse_args(args, s)
-    counts = countmsa(parsed_args["msa"])
+    const alphabet = "ACGT"
 
-    update("generating rate grid .. ")
+    counts = countmsa(parsed_args["msa"], alphabet)
+
     # rates = loadrates()
     rates = rategrid(parsed_args["grid-density"])
-    done()
 
-    update("computing grid scores .. ")
-    conditionals, scalers = gridscores(counts, rates)
-    done()
+    conditionals, scalers = gridscores(counts, rates, alphabet)
 
-    lls, ws = mcmc(conditionals, scalers, parsed_args["chain-length"], parsed_args["burnin-length"])
+    lls, ws = mcmc(
+        conditionals, scalers,
+        chain_length=parsed_args["chain-length"], burnin_fraction=parsed_args["burnin-fraction"])
+
     posteriors = postproc(conditionals', ws)
 
-    callvariants(counts, rates, posteriors, parsed_args["target-rate"], parsed_args["posterior-threshold"])
+    variants = callvariants(
+        counts, rates, posteriors, alphabet,
+        target_rate=parsed_args["target-rate"], posterior_threshold=parsed_args["posterior-threshold"])
+
+    if "filter" in keys(parsed_args)
+        filterseqs(parsed_args["msa"], variants, parsed_args["filter"], alphabet)
+    end
 end
 
 main(ARGS)
