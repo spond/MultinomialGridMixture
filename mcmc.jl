@@ -2,6 +2,7 @@
 
 using ArgParse
 using FastaIO
+using JSON
 
 const AMBIGS = Dict{String, Char}(
     [
@@ -51,24 +52,29 @@ function countmsa(msa::String, alphabet::String)
     counts
 end
 
-function rategrid(n::Integer)
+function rategrid(n::Integer, error_threshold::Real)
     update("generating rate grid .. ")
-    rates = 1 / (2 .^ linspace(2, 10, n))
-    rg = Array(Float64, (4 * length(rates) ^ 3, 4))
-    i = 1
+    rates = vcat(1 / (2 .^ linspace(2, 10, div (n,2))), error_threshold*logspace(log(10,.9), log(10,1.1), div(n,2)))
+    uniques = Set()
     for a in rates
         for b in rates
             for c in rates
                 M = 1 - (a + b + c)
-                rg[i    , :] = [M a b c]
-                rg[i + 1, :] = [a M b c]
-                rg[i + 2, :] = [a b M c]
-                rg[i + 3, :] = [a b c M]
-                i += 4
+		        add! (uniques, [M a b c])
+		        add! (uniques, [a M b c])
+                add! (uniques, [a b M c])
+                add! (uniques, [a b c M])
+            	
             end
         end
     end
     done()
+    i = 1
+    rg = Array (Float64, (length (uniques),4))
+    for r in uniques
+	    rg[i, :] = r 
+	    i += 1
+    end
     return rg
 end
 
@@ -139,7 +145,7 @@ function ldensity(weights::Array{Float64,2}, alpha::Float64)
         return 1e-10
     end
     if alpha == 1
-        return 0
+        return 0.0
     end
     n = length(weights)
     r = lgamma(n * alpha) - n * lgamma(alpha)
@@ -175,7 +181,7 @@ function mcmc(
     weights = transpose((rand((npoints, 1)) .* (1.2 * sum_by_site - 0.8 * sum_by_site)) + 0.8 * sum_by_site)
     weights /= sum(weights)
 
-    stepsize = max(min(1 / npoints, 1 / nsites), median(weights))
+    stepsize = max(2. / max(npoints, nsites), median(weights))
 
     nsample = div(chain_length - nburnin, expected_nsamples)
     sampled_weights = zeros(Float64, (expected_nsamples, npoints))
@@ -276,20 +282,42 @@ function postproc(conditionals::Array{Float64,2}, ws::Array{Float64,2})
     normalization = conditionals * priors
     posteriors = ((1 / normalization) .* eye(nsites)) * (conditionals * (priors .* eye(npoints)))
     done()
-    return posteriors
+    return (priors, posteriors)
 end
 
 function callvariants(
         counts::Array{Int64,2},
         rates::Array{Float64,2},
+        priors::Array{Float64,2},
         posteriors::Array{Float64,2},
         alphabet::String;
         target_rate::Float64=0.1,
-        posterior_threshold::Float64=0.999)
+        posterior_threshold::Float64=0.999,
+        json_file=nothing,
+        min_coverage::Int64=100)
 
     update("calling variants .. ")
+    
+    
     nsites, npoints = size(posteriors)
-    posterior_prob = posteriors * map(x -> x > target_rate, rates)
+    posterior_prob = posteriors * map(x -> x >= target_rate, rates)
+    
+    if json_file != nothing
+        overall_report = Dict()
+        rate_dict = Dict {Int64, Dict{String,Float64}}()
+        for i in 1:npoints
+            if priors[i] >= 0.5/nsites
+                rate_dict [i] = (String=>Float64)[
+                        string(alphabet[N]) => rates[i,N] for N = 1:length(alphabet) ]
+                rate_dict [i]["weight"] = priors[i]
+            end 
+        end
+        posterior_means = posteriors * rates
+        posterior_dict = Dict {Int64, Dict{String,Any}}()
+        overall_report ["priors"] = rate_dict
+        consensus = ""
+    end
+    
     variants = Dict{Int64,String}()
     for i in 1:nsites
         s = Set{Char}()
@@ -303,8 +331,29 @@ function callvariants(
             println("$i: $s_,\t[$(join(counts[i, :], '\t'))]")
         end
         variants[i] = s_
+        if json_file != nothing
+            if sum (counts[i,:]) >= min_coverage
+                index = indmax (posterior_prob[i,:])
+                consensus = *(consensus,string(alphabet[index]))
+            else
+                consensus = *(consensus,"-")
+            end
+            posterior_dict[i] = (String=>Any)[
+                string(alphabet[N]) => [posterior_prob[i,N], posterior_means[i,N], counts[i,N]] for N = 1:length(alphabet) ]
+            posterior_dict[i]["variants"] = s_
+        end
+        
     end
     done()
+    
+    if json_file != nothing
+        overall_report["consensus"] = consensus
+        overall_report["posteriors"] = posterior_dict
+        json_out = open (json_file, "w")
+        JSON.print (json_out, overall_report)
+        close (json_out)
+    end
+    
     return variants
 end
 
@@ -328,7 +377,7 @@ function filterseqs(msa::String, variants::Dict{Int64,String}, dest::String, alp
                 seq_[j] = seq[j]
                 if v < length(sites) && j == sites[v]
                     idx = index(alphabet, seq[j])
-                    if idx > 0 && !varmask[v, idx]
+                    if idx > 0 && !varmask[v, idx] && variants[sites[v]] in keys(AMBIGS)
                         seq_[j] = AMBIGS[variants[sites[v]]]
                     end
                     v += 1
@@ -375,17 +424,18 @@ function main(args)
             default = 0.95
         "--filter", "-f"
             arg_type = String
+        "--json-report", "-j"
+            arg_type = String
         "msa"
             required = true
     end
 
     parsed_args = parse_args(args, s)
+
+    rates = rategrid(parsed_args["grid-density"], parsed_args["target-rate"])
+
     const alphabet = "ACGT"
-
     counts = countmsa(parsed_args["msa"], alphabet)
-
-    # rates = loadrates()
-    rates = rategrid(parsed_args["grid-density"])
 
     conditionals, scalers = gridscores(counts, rates, alphabet)
 
@@ -393,11 +443,11 @@ function main(args)
         conditionals, scalers,
         chain_length=parsed_args["chain-length"], burnin_fraction=parsed_args["burnin-fraction"])
 
-    posteriors = postproc(conditionals', ws)
+    priors, posteriors = postproc(conditionals', ws)
 
     variants = callvariants(
-        counts, rates, posteriors, alphabet,
-        target_rate=parsed_args["target-rate"], posterior_threshold=parsed_args["posterior-threshold"])
+        counts, rates, priors, posteriors, alphabet,
+        target_rate=parsed_args["target-rate"], posterior_threshold=parsed_args["posterior-threshold"], json_file = parsed_args["json-report"])
 
     if "filter" in keys(parsed_args)
         filterseqs(parsed_args["msa"], variants, parsed_args["filter"], alphabet)
