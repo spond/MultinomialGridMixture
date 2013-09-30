@@ -113,13 +113,14 @@ function gridscores(counts::Array{Int64,2}, rates::Array{Float64,2}, alphabet::S
     nsites, _ = size(counts)
     conditionals = Array(Float64, (npoints, nsites))
     scalers = Array(Float64, (nsites,))
+    log_rates = log (rates)
     for i in 1:nsites
-        m = realmin(Float64)
+        m = -realmax(Float64)
         @inbounds c = lmc(counts, i, nchars)
         for j in 1:npoints
-            s = c
-            for k in 1:nchars
-                @inbounds s += counts[i, k] * log(rates[j, k])
+           s = c
+           for k in 1:nchars
+                @inbounds s += counts[i, k] * log_rates[j, k]
             end
             if s > m
                 m = s
